@@ -1,2 +1,4 @@
 /gowechat:
         repo: https://github.com/bigwhite/gowechat
+        allows:
+                - 127.0.0.1

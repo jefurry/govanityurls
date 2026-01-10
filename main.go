@@ -4,59 +4,119 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
-	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 
 	"gopkg.in/yaml.v2"
 )
 
-var host string
+var (
+	host string
 
-var m map[string]struct {
-	Repo    string `yaml:"repo,omitempty"`
-	Display string `yaml:"display,omitempty"`
-}
+	m map[string]struct {
+		Repo    string   `yaml:"repo,omitempty"`
+		Display string   `yaml:"display,omitempty"`
+		Allows  []string `yaml:"allows,omitempty"`
+	}
+)
 
 func init() {
 	flag.StringVar(&host, "host", "", "custom domain name, e.g. tonybai.com")
 
-	vanity, err := ioutil.ReadFile("./vanity.yaml")
+	vanityBytes, err := os.ReadFile("./vanity.yaml")
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := yaml.Unmarshal(vanity, &m); err != nil {
+	if err := yaml.Unmarshal(vanityBytes, &m); err != nil {
 		log.Fatal(err)
 	}
-	for _, e := range m {
-		if e.Display != "" {
+	for path, entry := range m {
+		if entry.Display != "" {
 			continue
 		}
-		if strings.Contains(e.Repo, "github.com") {
-			e.Display = fmt.Sprintf("%v %v/tree/master{/dir} %v/blob/master{/dir}/{file}#L{line}", e.Repo, e.Repo, e.Repo)
+		if strings.Contains(entry.Repo, "github.com") {
+			entry.Display = fmt.Sprintf("%v %v/tree/master{/dir} %v/blob/master{/dir}/{file}#L{line}",
+				entry.Repo, entry.Repo, entry.Repo)
+			m[path] = entry // 写回修改后的结构体
 		}
 	}
 }
 
+// 获取客户端真实IP（支持常见代理头）
+func realIP(r *http.Request) string {
+	if ip := r.Header.Get("CF-Connecting-IP"); ip != "" {
+		return strings.TrimSpace(ip)
+	}
+	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
+		parts := strings.SplitN(ip, ",", 2)
+		return strings.TrimSpace(parts[0])
+	}
+	if ip := r.Header.Get("X-Real-IP"); ip != "" {
+		return strings.TrimSpace(ip)
+	}
+
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return host
+}
+
+// 判断 IP 是否在允许列表中（支持 CIDR 和单 IP）
+func ipAllowed(clientIP string, allows []string) bool {
+	if len(allows) == 0 {
+		return true // 未配置 = 全部放行
+	}
+
+	ip := net.ParseIP(clientIP)
+	if ip == nil {
+		return false
+	}
+
+	for _, rule := range allows {
+		rule = strings.TrimSpace(rule)
+		if rule == clientIP {
+			return true
+		}
+
+		_, ipnet, err := net.ParseCIDR(rule)
+		if err == nil && ipnet.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 func handle(w http.ResponseWriter, r *http.Request) {
-	current := r.URL.Path
-	p, ok := m[current]
+	path := r.URL.Path
+
+	// 获取该路径的配置
+	conf, ok := m[path]
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
 
+	// IP 白名单检查
+	clientIP := realIP(r)
+	if !ipAllowed(clientIP, conf.Allows) {
+		log.Printf("Forbidden: %s → %s", clientIP, path)
+		//http.Error(w, "403 Forbidden - IP not allowed", http.StatusForbidden)
+		http.Redirect(w, r, "https://yuanc.com", http.StatusFound)
+		return
+	}
+
+	// 渲染模板
 	if err := vanityTmpl.Execute(w, struct {
 		Import  string
 		Repo    string
 		Display string
 	}{
-		Import:  host + current,
-		Repo:    p.Repo,
-		Display: p.Display,
+		Import:  host + path,
+		Repo:    conf.Repo,
+		Display: conf.Display,
 	}); err != nil {
-		http.Error(w, "cannot render the page", http.StatusInternalServerError)
+		http.Error(w, "cannot render template", http.StatusInternalServerError)
 	}
 }
 
@@ -74,9 +134,9 @@ Nothing to see here; <a href="https://godoc.org/{{.Import}}">see the package on 
 </html>`)
 
 func usage() {
-	fmt.Println("govanityurls is a service that allows you to set custom import paths for your go packages\n")
+	fmt.Println("govanityurls - custom go import path service")
 	fmt.Println("Usage:")
-	fmt.Println("\t govanityurls -host [HOST_NAME]\n")
+	fmt.Println("\t govanityurls -host example.com")
 	flag.PrintDefaults()
 }
 
@@ -88,6 +148,10 @@ func main() {
 		return
 	}
 
-	http.Handle("/", http.HandlerFunc(handle))
-	log.Fatalln(http.ListenAndServe("0.0.0.0:8080", nil))
+	if !strings.HasSuffix(host, "/") {
+		host += "/"
+	}
+
+	log.Printf("Starting govanityurls | host: %s | listening on :8080", host)
+	log.Fatal(http.ListenAndServe(":8080", http.HandlerFunc(handle)))
 }
