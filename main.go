@@ -112,7 +112,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		Repo    string
 		Display string
 	}{
-		Import:  host + path,
+		Import:  strings.TrimRight(host, "/") + "/" + strings.TrimLeft(path, "/"),
 		Repo:    conf.Repo,
 		Display: conf.Display,
 	}); err != nil {
